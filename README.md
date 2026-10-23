@@ -40,3 +40,4 @@ Open http://localhost:8501 — default password **admin123** (change it in Setti
 3. Pay teachers → **Salaries → Pay Salary** → print slip.
 4. Record bills in **Expenses**. Check **Reports** for profit/loss.
 5. Download a backup.
+# PMS-EMS
