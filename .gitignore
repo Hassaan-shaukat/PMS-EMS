@@ -1,0 +1,4 @@
+.streamlit/secrets.toml
+__pycache__/
+data/school_data.tmp.xlsx
+data/*.xlsx
