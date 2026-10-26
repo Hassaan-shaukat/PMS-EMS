@@ -1,11 +1,13 @@
-"""Excel-backed storage.
+"""Storage layer.
 
-All data lives in a single workbook (data/school_data.xlsx), one sheet per table.
-You can open that file in Excel at any time to view or print your records.
+On Streamlit Cloud the data lives in a Google Sheet (one tab per table), so it survives
+restarts. This is used when `gcp_service_account` and `spreadsheet_url` are set in secrets.
+Without those secrets (e.g. running on your own PC) data lives in data/school_data.xlsx.
 """
 import hashlib
 import os
 import threading
+import time
 from io import BytesIO
 
 import pandas as pd
@@ -51,18 +53,44 @@ DEFAULT_SETTINGS = {
 }
 
 
+def _use_sheets():
+    try:
+        return "gcp_service_account" in st.secrets and "spreadsheet_url" in st.secrets
+    except Exception:  # no secrets file
+        return False
+
+
 def init_db():
-    """Create the workbook with empty sheets on first run."""
+    """Create empty tables with defaults on first run."""
+    if _use_sheets():
+        _sheets_init()
+        return
     os.makedirs(DATA_DIR, exist_ok=True)
     if os.path.exists(DB_PATH):
         return
+    _write_all(_default_tables())
+
+
+def _default_tables():
     sheets = {name: pd.DataFrame(columns=cols) for name, cols in SCHEMA.items()}
     sheets["classes"] = pd.DataFrame({"class_name": DEFAULT_CLASSES, "default_fee": 0})
     sheets["settings"] = pd.DataFrame(list(DEFAULT_SETTINGS.items()), columns=["key", "value"])
-    _write_all(sheets)
+    return sheets
+
+
+def load_all():
+    if _use_sheets():
+        raw = _sheets_read_all()
+    else:
+        raw = _read_all(DB_PATH, os.stat(DB_PATH).st_mtime_ns)
+    return {k: v.copy() for k, v in raw.items()}
 
 
 def _write_all(sheets):
+    if _use_sheets():
+        for name, df in sheets.items():
+            _sheets_write(name, df)
+        return
     # Write to a temp file then swap, so a crash never leaves a half-written workbook.
     tmp = os.path.join(DATA_DIR, "school_data.tmp.xlsx")
     with pd.ExcelWriter(tmp, engine="openpyxl") as writer:
@@ -71,15 +99,113 @@ def _write_all(sheets):
     os.replace(tmp, DB_PATH)
 
 
+def _write_table(name, df):
+    if _use_sheets():
+        _sheets_write(name, df)
+    else:
+        data = load_all()
+        data[name] = df
+        _write_all(data)
+
+
 @st.cache_data(show_spinner=False)
 def _read_all(path, mtime_ns):
     # mtime_ns is part of the cache key, so any write invalidates the cache.
     return pd.read_excel(path, sheet_name=None, dtype=object, engine="openpyxl")
 
 
-def load_all():
-    raw = _read_all(DB_PATH, os.stat(DB_PATH).st_mtime_ns)
-    return {k: v.copy() for k, v in raw.items()}
+# ---------- Google Sheets backend ----------
+
+_CACHE_TTL = 30  # seconds; picks up edits made directly in the Google Sheet
+_cache = {"data": None, "time": 0.0}
+_initialized = False
+
+
+@st.cache_resource(show_spinner=False)
+def _spreadsheet():
+    import gspread
+    client = gspread.service_account_from_dict(dict(st.secrets["gcp_service_account"]))
+    return client.open_by_url(st.secrets["spreadsheet_url"])
+
+
+def _sheets_init():
+    global _initialized
+    if _initialized:
+        return
+    with _lock:
+        sh = _spreadsheet()
+        existing = [ws.title for ws in sh.worksheets()]
+        for name, df in _default_tables().items():
+            if name not in existing:
+                sh.add_worksheet(title=name, rows=max(len(df) + 1, 2), cols=len(df.columns))
+                _sheets_write(name, df)
+        # Remove Google's empty starter tab once our tabs exist.
+        if "Sheet1" in existing and "Sheet1" not in SCHEMA:
+            try:
+                sh.del_worksheet(sh.worksheet("Sheet1"))
+            except Exception:
+                pass
+        _cache["data"] = None
+        _initialized = True
+
+
+def _sheets_read_all():
+    with _lock:
+        if _cache["data"] is not None and time.time() - _cache["time"] < _CACHE_TTL:
+            return _cache["data"]
+        sh = _spreadsheet()
+        names = [ws.title for ws in sh.worksheets()]
+        resp = sh.values_batch_get(["'%s'" % n for n in names],
+                                   params={"valueRenderOption": "UNFORMATTED_VALUE"})
+        data = {}
+        for name, vr in zip(names, resp.get("valueRanges", [])):
+            rows = vr.get("values", [])
+            if not rows:
+                data[name] = pd.DataFrame(columns=SCHEMA.get(name, []), dtype=object)
+                continue
+            header, body = rows[0], rows[1:]
+            body = [r + [""] * (len(header) - len(r)) for r in body]
+            data[name] = pd.DataFrame([r[:len(header)] for r in body], columns=header, dtype=object)
+        _cache["data"], _cache["time"] = data, time.time()
+        return data
+
+
+def _cell(col, v):
+    if col in NUMERIC:
+        n = pd.to_numeric(v, errors="coerce")
+        n = 0.0 if pd.isna(n) else float(n)
+        return int(n) if n.is_integer() else n
+    return _to_str(v)
+
+
+def _sheets_write(name, df):
+    with _lock:
+        cols = list(df.columns)
+        values = [cols] + [[_cell(c, v) for c, v in zip(cols, row)]
+                           for row in df.itertuples(index=False, name=None)]
+        sh = _spreadsheet()
+        try:
+            ws = sh.worksheet(name)
+        except Exception:
+            ws = sh.add_worksheet(title=name, rows=len(values), cols=len(cols))
+        # Grow first, write, then shrink, so the data is never blank if a step fails.
+        if ws.row_count < len(values) or ws.col_count < len(cols):
+            ws.resize(rows=max(ws.row_count, len(values)), cols=max(ws.col_count, len(cols)))
+        ws.update(values, "A1")
+        if ws.row_count > len(values) or ws.col_count > len(cols):
+            ws.resize(rows=max(len(values), 2), cols=len(cols))
+            if len(values) == 1:
+                ws.batch_clear(["A2:%s2" % _col_letter(len(cols))])
+        if _cache["data"] is not None:
+            _cache["data"][name] = pd.DataFrame(values[1:], columns=cols, dtype=object)
+
+
+def _col_letter(n):
+    s = ""
+    while n:
+        n, r = divmod(n - 1, 26)
+        s = chr(65 + r) + s
+    return s
 
 
 def _to_str(v):
@@ -119,9 +245,7 @@ def load(name):
 
 def save(name, df):
     with _lock:
-        data = load_all()
-        data[name] = _normalize(name, df.copy())
-        _write_all(data)
+        _write_table(name, _normalize(name, df.copy()))
 
 
 def append(name, row):
@@ -158,8 +282,15 @@ def set_settings(values):
 
 
 def export_bytes():
-    with open(DB_PATH, "rb") as f:
-        return f.read()
+    if not _use_sheets():
+        with open(DB_PATH, "rb") as f:
+            return f.read()
+    buf = BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        for name, df in load_all().items():
+            df = _normalize(name, df) if name in SCHEMA else df
+            df.to_excel(writer, sheet_name=name, index=False)
+    return buf.getvalue()
 
 
 def restore(file_bytes):
@@ -168,4 +299,5 @@ def restore(file_bytes):
     if missing:
         raise ValueError("This is not a valid backup file. Missing sheets: " + ", ".join(missing))
     with _lock:
-        _write_all(sheets)
+        _write_all({name: _normalize(name, df) if name in SCHEMA else df.fillna("")
+                    for name, df in sheets.items()})
