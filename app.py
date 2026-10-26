@@ -10,6 +10,11 @@ import utils  # noqa: E402
 from modules import (attendance, dashboard, expenses, fees, reports,  # noqa: E402
                      salaries, settings, students, teachers)
 
+ok, msg = db.storage_status()
+if not ok:
+    st.error("⚠️ " + msg + " Data will be LOST when the app restarts. See README → Permanent storage.")
+    if db._use_sheets():  # secrets are set but Google Sheets can't be reached
+        st.stop()
 db.init_db()
 if not utils.check_login():
     st.stop()
@@ -29,6 +34,7 @@ PAGES = {
 with st.sidebar:
     st.markdown("## 🏫 " + db.get_setting("school_name"))
     st.caption(date.today().strftime("%A, %d %B %Y"))
+    st.caption(("🟢 " if ok else "🔴 ") + msg)
     choice = st.radio("Menu", list(PAGES), label_visibility="collapsed")
     st.divider()
     st.download_button("💾 Backup all data", db.export_bytes(), use_container_width=True,

@@ -53,11 +53,45 @@ DEFAULT_SETTINGS = {
 }
 
 
+def _sheet_url():
+    """The Google Sheet URL from secrets, also found if pasted inside [gcp_service_account]."""
+    try:
+        sa = st.secrets.get("gcp_service_account", {})
+        return st.secrets.get("spreadsheet_url") or sa.get("spreadsheet_url") or ""
+    except Exception:  # no secrets file
+        return ""
+
+
+def _service_account():
+    sa = dict(st.secrets["gcp_service_account"])
+    sa.pop("spreadsheet_url", None)
+    sa.pop("ADMIN_PASSWORD", None)
+    return sa
+
+
 def _use_sheets():
     try:
-        return "gcp_service_account" in st.secrets and "spreadsheet_url" in st.secrets
+        return "gcp_service_account" in st.secrets and bool(_sheet_url())
     except Exception:  # no secrets file
         return False
+
+
+def storage_status():
+    """(ok, message) describing where data is being saved, for the sidebar."""
+    try:
+        has_sa = "gcp_service_account" in st.secrets
+    except Exception:
+        has_sa = False
+    if not has_sa and not _sheet_url():
+        return False, "Saving to a temporary Excel file. Google Sheets secrets not found."
+    if not has_sa:
+        return False, "Secrets: [gcp_service_account] section is missing."
+    if not _sheet_url():
+        return False, "Secrets: spreadsheet_url is missing."
+    try:
+        return True, "Saving to Google Sheet: " + _spreadsheet().title
+    except Exception as e:
+        return False, "Google Sheets error: %s: %s" % (type(e).__name__, e)
 
 
 def init_db():
@@ -124,8 +158,8 @@ _initialized = False
 @st.cache_resource(show_spinner=False)
 def _spreadsheet():
     import gspread
-    client = gspread.service_account_from_dict(dict(st.secrets["gcp_service_account"]))
-    return client.open_by_url(st.secrets["spreadsheet_url"])
+    client = gspread.service_account_from_dict(_service_account())
+    return client.open_by_url(_sheet_url())
 
 
 def _sheets_init():
